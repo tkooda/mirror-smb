@@ -1,0 +1,198 @@
+#!/usr/bin/python
+
+"""mirror-smb - v0.1
+
+Update a local mirror copy of a remote SMB fileserver.
+
+Usage: mirror-smb [opts] smb://<hostname>/<sharename> [remote directory..]
+   -h --help  :  this help
+   -u --username <username>  :  specify SMB username
+   -p --password <password>  :  specify SMB password
+   -w --workgroup <workgroup>  :  specify SMB workgroup
+   -q --quiet  :  supress usual output
+   -d --debug <num>  :  specify debug level
+"""
+
+## AUTHOR:
+##   Thor J. Kooda - 2012-03-23
+
+## REQUIRES:
+##   python-smbc - v1.0.11 or newer : https://fedorahosted.org/pysmbc/ticket/3
+
+## NOTES:
+##  - only examines remote file size/mtime to identify if they're modified
+##  - always recurses remote SMB directories
+##  - "params.c:OpenConfFile()" errors on stdout are from python-smbc module
+##  - XXX FIXME: does not prune local directory of extra dirs/files
+
+
+import os
+import sys
+import getopt
+import smbc
+import tempfile
+import stat
+
+
+USERNAME = ""
+PASSWORD = ""
+WORKGROUP = ""
+URI_BASE = ""
+DIR_LOCAL = ""
+QUIET = False
+DEBUG = 0
+
+TYPE_DIR = 7
+TYPE_FILE = 8
+MODE = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
+
+
+def do_debug( level, s ):
+	if level <= DEBUG:
+		print >>sys.stderr, "DEBUG(%d): %s" % ( level, s )
+
+
+def my_auth_fn( server, share, workgroup, username, password ):
+	return ( WORKGROUP, USERNAME, PASSWORD )
+
+
+def get_dents( ctx, path="" ):
+	return ctx.opendir( os.path.join( URI_BASE, path ) ).getdents()
+
+
+def copy_file( ctx, path, st_remote=None ):
+	do_debug( 3, "copy_file: " + path )
+	
+	if not QUIET:
+		if st_remote:
+			print "updated: %s" % path
+		else:
+			print "copied: %s" % path
+	
+	base_dir = os.path.dirname( path )
+	base_file = os.path.basename( path )
+	
+	fd_local, fn_local = tempfile.mkstemp( suffix=".tmp", prefix="." + base_file + ".", dir=base_dir )
+	do_debug( 9, "mkstemp: %s" % fn_local )
+
+	try:
+		fd_remote = ctx.open( os.path.join( URI_BASE, path ) )
+		buf = fd_remote.read()
+		os.write( fd_local, buf ) # XXX FIXME: add while-loop buffer for large files?
+		
+		os.close( fd_local )
+		fd_remote.close()
+		
+		os.chmod( fn_local, MODE )
+		
+		if not st_remote:
+			st_remote = ctx.stat( os.path.join( URI_BASE, path ) )
+		
+		os.utime( fn_local, ( st_remote[ stat.ST_ATIME ], st_remote[ stat.ST_MTIME ] ) )
+		os.rename( fn_local, path )
+	except KeyboardInterrupt:
+		# remove temp file
+		os.remove( fn_local )
+		sys.exit( 3 )
+
+
+def is_same( st_local, st_remote ):
+	return st_local[ stat.ST_SIZE ] == st_remote[ stat.ST_SIZE ] \
+		   and st_local[ stat.ST_MTIME ] == st_remote[ stat.ST_MTIME ]
+
+
+def mirror_dir( ctx, path="" ):
+	if not os.path.isdir( path ):
+		do_debug( 2, "mkdir: " + path )
+		if not QUIET:
+			print "mkdir: %s" % path
+		os.makedirs( path )
+	
+	for dent in get_dents( ctx, path ):
+		if dent.name == "." or dent.name == "..":
+			continue
+		path_item = os.path.join( path, dent.name )
+		
+		if dent.smbc_type == TYPE_DIR:
+			do_debug( 8, "recursing: %s" % path_item )
+			mirror_dir( ctx, path_item ) # recurse
+			continue
+		
+		# is file..
+		
+		# copy if missing ..
+		if not os.path.isfile( path_item ):
+			copy_file( ctx, path_item )
+			continue
+		
+		# compare existing ..
+		do_debug( 6, "compare: %d %s" % ( dent.smbc_type, path_item ) )
+		
+		st_local = os.stat( path_item )
+		st_remote = ctx.stat( os.path.join( URI_BASE, path_item ) )
+		
+#		print >>sys.stderr, "DEBUG: st_local: ", st_local # DEBUG
+#		print >>sys.stderr, "DEBUG: st_remote:", st_remote # DEBUG
+		
+		if not is_same( st_local, st_remote ):
+			do_debug( 7, "not_same: %s" % path_item )
+			copy_file( ctx, path_item, st_remote )
+
+
+class Usage(Exception):
+	def __init__(self, msg):
+		self.msg = msg
+
+
+def main( argv=None ):
+	if argv is None:
+		argv = sys.argv
+	
+	try:
+		try:
+			opts, args = getopt.getopt( argv[1:], "hu:p:w:qd:",
+										[ "help", "username=", "password=",
+										  "workgroup=", "quiet", "debug=", ] )
+		except getopt.error, msg:
+			raise Usage(msg)
+		
+		for opt, arg in opts:
+			if opt in ( "-h", "--help" ):
+				print __doc__
+				sys.exit(0)
+			elif opt in ( "-u", "--username" ):
+				global USERNAME
+				USERNAME = arg
+			elif opt in ( "-p", "--password" ):
+				global PASSWORD
+				PASSWORD = arg
+			elif opt in ( "-w", "--workgroup" ):
+				global WORKGROUP
+				WORKGROUP = arg
+			elif opt in ( "-q", "--quiet" ):
+				global QUIET
+				QUIET = True
+			elif opt in ( "-d", "--debug" ):
+				global DEBUG
+				DEBUG = int( arg )
+		
+		if len(args) >= 1:
+			global URI_BASE
+			URI_BASE = args[0]
+		else:
+			raise Usage( __doc__ )
+		
+		ctx = smbc.Context( auth_fn=my_auth_fn, debug=0 )
+
+		for remote_dir in args[ 1: ]:
+			mirror_dir( ctx, remote_dir )
+		
+	except Usage, err:
+		print >>sys.stderr, err.msg
+		print >>sys.stderr, "for help use --help"
+		return 2
+														 
+
+if __name__ == "__main__":
+	sys.exit( main() )
+
